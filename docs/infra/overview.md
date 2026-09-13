@@ -182,7 +182,7 @@ Node (subnet privada) ──pull da imagem :sha──▶ Amazon ECR (via NAT)
 - **Entrada pública**: o endereço do API Gateway. `ANY /api/{proxy+}` cobre toda a API e `POST /api/auth/login` existe como rota explícita apenas para receber limitação de frequência mais restritiva. O API Gateway **não valida credenciais**: um `401` numa rota protegida é produzido pela própria API. Um caminho não publicado recebe `404` **do API Gateway**, sem alcançar o cluster.
 - **Entrada de diagnóstico**: `kubectl port-forward -n oficina svc/oficina-api 3000:3000` → API em `http://localhost:3000` (Swagger em `/api/docs`). O `NodePort` também possui `ClusterIP`, portanto o acesso por DNS interno e o `port-forward` usam o mesmo Service. Ver [kubernetes.md › Acesso à aplicação](kubernetes.md#acesso-à-aplicação-em-kubernetes).
 - **Endereço de origem do cliente**: fica registrado **no log de acesso do API Gateway**, não na aplicação. HTTP APIs convertem a família `X-Forwarded-*` no cabeçalho padrão `Forwarded` (RFC 7239), que o Express não interpreta — por isso `TRUSTED_PROXY_CIDRS` continua vazio, e isso é decisão fechada, não pendência. A ligação entre os dois lados é o `x-request-id`: o API Gateway o sobrescreve com o identificador da requisição dela, e a API já prefere esse cabeçalho de entrada, de modo que a linha do log de acesso e a linha do log estruturado compartilham o mesmo identificador.
-- **API → PostgreSQL**: via `DATABASE_URL` (`api-secret`) apontando para o endpoint do **Amazon RDS**, fora do cluster, alcançado pela rede a partir das subnets privadas. Quem reporta se esse caminho está de pé é a `readinessProbe` da API em `/api/health/ready` — não existe pod de banco para inspecionar.
+- **API → PostgreSQL**: via `DATABASE_URL` (`database-credentials`) apontando para o endpoint do **Amazon RDS**, fora do cluster, alcançado pela rede a partir das subnets privadas. Quem reporta se esse caminho está de pé é a `readinessProbe` da API em `/api/health/ready` — não existe pod de banco para inspecionar.
 - **API → MailHog**: SMTP em `mailhog:1025` (do `api-config`), para os e-mails de aprovação/rejeição de orçamento.
 - **Egresso**: pods e nodes nas subnets privadas saem para a internet **pelo NAT Gateway** (inclusive o `pull` das imagens do ECR — não há VPC endpoints).
 
@@ -201,11 +201,12 @@ A entrega segue a separação entre os sete repositórios:
 
 1. **`oficina-mecanica-infra-base`**: Provisiona a VPC, subnets públicas/privadas, IGW, NAT Gateway e tabelas de roteamento, exportando o estado no S3.
 2. **`oficina-mecanica-infra-k8s`**: Consome a VPC e subnets do estado de rede via `data.terraform_remote_state`, provisionando cluster EKS, Node Group, ECR, NLB interno, namespace `oficina` e Metrics Server.
-3. **`oficina-mecanica-infra-database`**: Consome a VPC e as subnets privadas e provisiona RDS PostgreSQL, DB subnet group, security group e segredo gerenciado.
+3. **`oficina-mecanica-infra-database`**: Consome a VPC e as subnets privadas e provisiona RDS PostgreSQL, DB subnet group e security group. O RDS gera a master password e mantém seu Secret no Secrets Manager; Terraform publica somente o ARN e deixa a rotação desabilitada.
 4. **`oficina-mecanica-api` (CD)**:
    - **`build-push-image`**: Constrói a imagem Docker multi-stage da aplicação NestJS e publica no Amazon ECR a tag por commit (`:sha`) e a tag móvel `:latest`.
-   - **`db-migrate`**: Executa o Kubernetes Job descartável aplicando `prisma migrate deploy` e `prisma db seed` de forma não-destrutiva.
-   - **`app-deploy`**: Renderiza os secrets/configmaps e aplica os manifests Kubernetes (Deployments, Services, HPA) validando o rollout.
+   - **`prepare-deploy`**: Descobre metadados/ARN pelo RDS, espera `available`/`active`, lê `AWSCURRENT` e materializa `DATABASE_URL` com percent-encoding e TLS em `database-credentials` usando Node.js inline e stdin. Em outro step, aplica JWTs/chave pública em `api-secret` e o ConfigMap, sem publicar outputs.
+   - **`db-migrate`**: Após build e preparação, executa somente o Job descartável de `prisma migrate deploy` + `prisma db seed` e aguarda sucesso, bloqueando o deploy em falha/timeout.
+   - **`app-deploy`**: Após sucesso da preparação e da migration, recebe a imagem do build, renderiza o pod template, aplica os manifests Kubernetes (Deployments, Services, HPA) e valida o rollout. O deploy greenfield não usa annotation/output de versão da credencial nem renova Pods automaticamente por mudança isolada do Secret.
 
 5. **`oficina-mecanica-api-gateway`**: Consome a VPC, as subnets privadas e o `api_nlb_listener_arn`, provisionando HTTP API, VPC Link, integrações, rotas e log de acesso.
 6. **`oficina-mecanica-lambda-customer-auth`**: Consome rede, endpoint/credencial do RDS e execution ARN do Gateway, provisionando a função e a permissão da rota `POST /customer-auth/login`.
@@ -223,7 +224,7 @@ Ao desfazer o caminho público, respeite a ordem inversa das dependências: reve
 - **Consequência aceita: a autorização é aplicada por controller, não por guard global.** Hoje todos os controllers de negócio declaram `@UseGuards` e `auth`/`health` são exceções deliberadas — não há buraco atual. O que muda com `ANY /api/{proxy+}` é o **custo de um esquecimento futuro**: um controller novo sem `@UseGuards` fica público na internet sem passar por nenhum outro repositório.
 - **Endpoint do EKS é público (mas autenticado).** O control plane tem `endpoint_public_access = true` **e** `endpoint_private_access = true`: o servidor de API do Kubernetes é alcançável pela internet, porém protegido por autenticação/autorização IAM+RBAC. O Security Group do control plane só aceita `443` **da CIDR da VPC**.
 - **Nodes em subnets privadas.** Sem IP público; todo egresso passa pelo NAT Gateway.
-- **Fluxo de segredos.** A credencial do banco alimenta a `DATABASE_URL` do `api-secret`, consumida pela API e montada no CD a partir das variáveis do repositório e do endpoint do RDS. Segredos de aplicação (`JWT_*`, `CUSTOMER_JWT_PUBLIC_KEY`) vêm dos GitHub Secrets e são renderizados no deploy. Detalhes em [ci-cd.md › Injeção de secrets](ci-cd.md#injeção-de-secrets-da-aplicação).
+- **Fluxo de segredos.** O CD usa apenas `RDS_INSTANCE_IDENTIFIER` e `K8S_NAMESPACE` como Variables, descobre o restante na AWS e materializa `DATABASE_URL` em `database-credentials`. `api-secret` fica restrito a `JWT_*` e `CUSTOMER_JWT_PUBLIC_KEY`, vindos dos GitHub Secrets. Pods e Jobs não leem AWS, e nenhum ESO/CSI/ASCP foi introduzido. Detalhes em [ci-cd.md › Injeção de secrets](ci-cd.md#injeção-de-secrets-da-aplicação).
 - **ECR com `scan_on_push`** e imagens criptografadas (`AES256`); análise SAST/DAST cobre o código e a API em execução — ver [Segurança](../security.md).
 
 ## Limitações e o que produção exigiria

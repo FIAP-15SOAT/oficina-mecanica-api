@@ -38,8 +38,9 @@ Os recursos em Kubernetes foram divididos por responsabilidade:
 | Banco de dados relacional (Amazon RDS PostgreSQL) | Terraform, em **stack própria** | [`oficina-mecanica-infra-database`](https://github.com/FIAP-15SOAT/oficina-mecanica-infra-database) — **fora do cluster**; nenhum manifesto em `k8s/` define workload de banco |
 | metrics-server | Terraform | [`oficina-mecanica-infra-k8s`](https://github.com/FIAP-15SOAT/oficina-mecanica-infra-k8s) (`terraform/k8s_metrics_server.tf`) |
 | DB migration Job (`00-db-migrate-job.yaml`) | Workflow de CD | Render + `kubectl apply` (job `db-migrate`) em `.github/workflows/cd.yml` |
-| API Secret (`01-api-secret.yaml`, referência para deploy manual) | Workflow de CD | `kubectl create secret --from-literal` (imperativo, não renderiza o YAML) em `.github/workflows/cd.yml` |
-| API ConfigMap (`02-api-configmap.yaml`) | Workflow de CD | Render de `OTEL_EXPORTER_OTLP_ENDPOINT` a partir de GitHub Actions Variables via `envsubst` + `kubectl apply` em `.github/workflows/cd.yml` |
+| Database Secret (`database-credentials`) | Workflow de CD | Job `prepare-deploy`: descoberta RDS + `GetSecretValue` e manifesto JSON por stdin; não há YAML com valor versionado |
+| Application Secret (`api-secret`; `01-api-secret.yaml` é referência) | Workflow de CD | Outro step de `prepare-deploy`: `kubectl create secret --from-literal` apenas para JWTs/chave pública |
+| API ConfigMap (`02-api-configmap.yaml`) | Workflow de CD | Job `prepare-deploy`: render de `OTEL_EXPORTER_OTLP_ENDPOINT` a partir de GitHub Actions Variables via `envsubst` + `kubectl apply` |
 | API Deployment (`03-api-deployment.yaml`) | Workflow de CD | Render + `kubectl apply` em `.github/workflows/cd.yml` |
 | MailHog Deployment (`03-mailhog-deployment.yaml`) | Workflow de CD | `kubectl apply` em `.github/workflows/cd.yml` (dependência de e-mail) |
 | API Service (`04-api-service.yaml`) | Workflow de CD | `kubectl apply` em `.github/workflows/cd.yml` |
@@ -54,16 +55,17 @@ Os recursos em Kubernetes foram divididos por responsabilidade:
 - `app.kubernetes.io/part-of` — sempre `oficina-mecanica` (a solução como um todo).
 - `managed-by: terraform` — presente apenas nos recursos provisionados pelo Terraform (`oficina-mecanica-infra-k8s`), distinguindo-os dos manifests aplicados pelo CD.
 
-**Wiring de configuração.** A configuração da API é injetada como variáveis de ambiente a partir de duas fontes, separando o sensível do não-sensível:
+**Wiring de configuração.** A configuração da API é injetada como variáveis de ambiente a partir de três fontes, separando ownership e sensibilidade:
 
 - `configMapKeyRef` → `api-config` (`ConfigMap`, **não sensível**): `NODE_ENV`, `PORT`, `JWT_EXPIRATION`, `JWT_REFRESH_EXPIRATION`, `BCRYPT_SALT_ROUNDS`, `MAIL_HOST`, `MAIL_PORT`, `TZ`, `CUSTOMER_JWT_ISSUER`, `CUSTOMER_JWT_AUDIENCE`, `LOG_LEVEL`, `OTEL_SERVICE_NAME`, `OTEL_SERVICE_NAMESPACE`, `TRUSTED_PROXY_CIDRS`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_LOGS_EXPORTER` e `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`.
-- `secretKeyRef` → `api-secret` (`Secret`, **sensível**): `DATABASE_URL`, `JWT_SECRET`, `JWT_REFRESH_SECRET`, `CUSTOMER_JWT_PUBLIC_KEY`.
+- `secretKeyRef` → `database-credentials` (`Secret`, **sensível**): somente `DATABASE_URL`, materializada pelo CD a partir de RDS/Secrets Manager.
+- `secretKeyRef` → `api-secret` (`Secret` da aplicação): `JWT_SECRET`, `JWT_REFRESH_SECRET`, `CUSTOMER_JWT_PUBLIC_KEY`.
 
 `CUSTOMER_JWT_ISSUER`/`CUSTOMER_JWT_AUDIENCE` são valores fixos e não secretos (identificadores de emissor/audiência do token externo), por isso vivem no ConfigMap; `CUSTOMER_JWT_PUBLIC_KEY` fica no Secret por uniformidade de injeção com os demais valores usados pela validação de JWT, embora uma chave pública não exija sigilo.
 
 O Deployment referencia cada chave individualmente (`valueFrom`), o que torna explícito no manifesto de onde vem cada env — em vez de um `envFrom` opaco.
 
-> ⚠️ **Formato do `CUSTOMER_JWT_PUBLIC_KEY` no GitHub Secret.** O job `db-migrate` do `cd.yml` cria o Secret de forma **imperativa** (`kubectl create secret generic ... --from-literal=CUSTOMER_JWT_PUBLIC_KEY="${CUSTOMER_JWT_PUBLIC_KEY}" --dry-run=client -o yaml | kubectl apply -f -`). `--from-literal` aceita o PEM com quebras de linha reais e o próprio `kubectl` faz o escape ao montar o Secret. **Por isso o GitHub Secret pode ser cadastrado com o PEM no formato natural, multilinha, exatamente como o `openssl` ou a autoridade certificadora o gerou**.
+> ⚠️ **Formato do `CUSTOMER_JWT_PUBLIC_KEY` no GitHub Secret.** O job `prepare-deploy` do `cd.yml` cria o Secret de forma **imperativa** (`kubectl create secret generic ... --from-literal=CUSTOMER_JWT_PUBLIC_KEY="${CUSTOMER_JWT_PUBLIC_KEY}" --dry-run=client -o yaml | kubectl apply -f -`). `--from-literal` aceita o PEM com quebras de linha reais e o próprio `kubectl` faz o escape ao montar o Secret. **Por isso o GitHub Secret pode ser cadastrado com o PEM no formato natural, multilinha, exatamente como o `openssl` ou a autoridade certificadora o gerou**.
 >
 > A [documentação de CI/CD](ci-cd.md#injeção-de-secrets-da-aplicação) explica por que interpolar esse PEM diretamente com `envsubst` pode quebrar o YAML e detalha a criação imperativa do Secret.
 >
@@ -138,7 +140,8 @@ A persistência relacional da aplicação é fornecida pelo **Amazon RDS (Postgr
 
 - Instância gerenciada PostgreSQL 16 (Single-AZ, `db.t4g.micro`, 20 GiB GP3).
 - Alocado nas subnets privadas da VPC, com Security Group restrito ao CIDR da VPC.
-- Acesso pela aplicação via `DATABASE_URL` injetada dinamicamente no `api-secret` — que precisa carregar os parâmetros descritos em [Conexão obrigatoriamente cifrada (TLS)](#conexão-obrigatoriamente-cifrada-tls).
+- A master password é gerada e mantida pelo RDS em um Secret do AWS Secrets Manager, com rotação automática desabilitada. O Terraform conhece ARN/status/KMS e metadados de conexão, não o valor da senha; `sensitive` sozinho não impediria sua presença no State.
+- O job `prepare-deploy` do CD descobre o Secret e o endpoint pelo identificador da instância, lê `AWSCURRENT` e materializa `DATABASE_URL` em `database-credentials` usando Node.js inline e manifesto JSON por stdin, com os parâmetros descritos em [Conexão obrigatoriamente cifrada (TLS)](#conexão-obrigatoriamente-cifrada-tls). Migration/seed ficam somente no job `db-migrate` seguinte.
 
 O [ADR de database sobre RDS](https://github.com/FIAP-15SOAT/oficina-mecanica-infra-database/blob/main/docs/adr/0001-banco-gerenciado-amazon-rds.md#postgresql-auto-hospedado-dentro-do-cluster-eks) preserva o diagnóstico histórico das tentativas de persistência com EBS CSI no EKS e as razões para abandonar `emptyDir`/`hostPath`.
 
@@ -146,7 +149,7 @@ O [ADR de database sobre RDS](https://github.com/FIAP-15SOAT/oficina-mecanica-in
 
 O parameter group `default.postgres16` traz **`rds.force_ssl = 1`** — padrão do sistema desde o PostgreSQL 15, não uma escolha desta stack. O servidor recusa qualquer conexão sem criptografia com `no pg_hba.conf entry for host "...", user "...", no encryption`, um SQLSTATE `28000` que o Prisma reporta como **`P1010 "User was denied access on the database"`**: uma mensagem de permissão para o que é, na verdade, ausência de TLS.
 
-Por isso a `DATABASE_URL` do `api-secret` termina em **`sslmode=require&uselibpqcompat=true`**. A mesma URL é lida por **dois clientes com defaults opostos**:
+Por isso a `DATABASE_URL` de `database-credentials` termina em **`sslmode=require&uselibpqcompat=true`**. A mesma URL é lida por **dois clientes com defaults opostos**:
 
 | Consumidor | Cliente | Sem `sslmode` na URL |
 |---|---|---|
@@ -166,9 +169,9 @@ O ambiente local não carrega esses parâmetros: `docker-compose` e Testcontaine
 Arquivos em `k8s/`:
 
 - `00-db-migrate-job.yaml`: Job **one-shot** de migração/seed do banco (`prisma migrate deploy` + `db seed`), com placeholders de nome (`JOB_NAME_PLACEHOLDER`) e imagem (`IMAGE_URI_PLACEHOLDER`); renderizado e aplicado pelo job `db-migrate` do CD antes do rollout — não é um recurso de estado da aplicação, por isso o prefixo `00-`. Detalhes em [Job de migração do banco](#job-de-migração-do-banco)
-- `01-api-secret.yaml`: referência dos secrets da aplicação (`DATABASE_URL`, `JWT_SECRET`, `JWT_REFRESH_SECRET` e `CUSTOMER_JWT_PUBLIC_KEY`) para deploy manual — o `cd.yml` não aplica este arquivo; ele cria o Secret de forma imperativa via `kubectl create secret --from-literal`, com os mesmos valores vindos dos GitHub Secrets e Variables
+- `01-api-secret.yaml`: referência apenas dos secrets da aplicação (`JWT_SECRET`, `JWT_REFRESH_SECRET` e `CUSTOMER_JWT_PUBLIC_KEY`) para deploy manual; `DATABASE_URL` pertence ao Secret separado `database-credentials`
 - `02-api-configmap.yaml`: variáveis não sensíveis da aplicação (`NODE_ENV`, `PORT`, `JWT_EXPIRATION`, `JWT_REFRESH_EXPIRATION`, `BCRYPT_SALT_ROUNDS`, `MAIL_HOST`, `MAIL_PORT`, `TZ`, `LOG_LEVEL`, `OTEL_SERVICE_NAME`, `OTEL_SERVICE_NAMESPACE`, `TRUSTED_PROXY_CIDRS`, `CUSTOMER_JWT_ISSUER`, `CUSTOMER_JWT_AUDIENCE` e as chaves de telemetria); o placeholder de `OTEL_EXPORTER_OTLP_ENDPOINT` é renderizado pelo CD a partir da variável homônima do GitHub Actions
-- `03-api-deployment.yaml`: deployment da API com placeholder de imagem (`IMAGE_URI_PLACEHOLDER`), `imagePullPolicy: Always`, consumo de Secret/ConfigMap (ver [wiring de configuração](#convenções-labels-e-wiring-de-configuração)) e probes de saúde
+- `03-api-deployment.yaml`: deployment da API com placeholder de imagem, `imagePullPolicy: Always`, consumo de Secret/ConfigMap (ver [wiring de configuração](#convenções-labels-e-wiring-de-configuração)) e probes de saúde
 - `03-mailhog-deployment.yaml`: deployment do MailHog para captura de e-mails enviados pela aplicação
 - `04-api-service.yaml`: Service **`NodePort`** da API (`3000` → `30080` nos nós). `NodePort` é um superconjunto de `ClusterIP`: o Service continua recebendo um ClusterIP e o DNS interno segue igual. A porta dos nós é o destino do target group do NLB interno provisionado em `oficina-mecanica-infra-k8s`, que por sua vez é o backend da integração privada do [API Gateway](https://github.com/FIAP-15SOAT/oficina-mecanica-api-gateway). O valor precisa casar com `api_node_port` naquele repositório
 - `04-mailhog-service.yaml`: Service `ClusterIP` do MailHog, expondo as portas SMTP (`1025`) e Web UI (`8025`) para acesso interno ao cluster
@@ -180,7 +183,7 @@ O `00-db-migrate-job.yaml` é um `Job` do Kubernetes executado **uma vez por dep
 
 - **`backoffLimit: 0` + `restartPolicy: Never`** — falha rápido, sem retentativas silenciosas: se a migração falhar, o Job falha imediatamente e o pipeline para (em vez de mascarar o erro com reinícios).
 - **`ttlSecondsAfterFinished: 1209600`** — o Job é coletado automaticamente **14 dias** após terminar, evitando acúmulo de Jobs concluídos no namespace (cada run cria um Job com nome renderizado, via `JOB_NAME_PLACEHOLDER`).
-- **Consumo da `DATABASE_URL`** — o container recebe `DATABASE_URL` via `secretKeyRef` do `api-secret` e executa:
+- **Consumo da `DATABASE_URL`** — o container recebe `DATABASE_URL` via `secretKeyRef` de `database-credentials` e executa:
 
   ```sh
   set -e
@@ -333,19 +336,18 @@ As rotas de saúde ficam **dentro** da fronteira de cobertura do access log — 
 
 ## Deploy em Kubernetes (manual)
 
-> Diferente do `cd.yml` (que usa `kubectl create secret --from-literal`, sem essa restrição — ver a nota de formato acima), o passo abaixo renderiza `01-api-secret.yaml` com `envsubst`. Nesse caminho, `CUSTOMER_JWT_PUBLIC_KEY` **precisa** estar em uma única linha, com `\n` literais no lugar das quebras, ou o YAML renderizado fica inválido. Prefira reproduzir o comando `kubectl create secret --from-literal` do `cd.yml` para colar o PEM no formato natural sem se preocupar com isso.
+> O caminho canônico de deploy manual é `workflow_dispatch`, pois ele descobre e materializa a credencial sem expô-la. Os comandos abaixo pressupõem que `database-credentials` já foi criado pelo CD no namespace e não leem seu valor. Ao renderizar `01-api-secret.yaml` com `envsubst`, `CUSTOMER_JWT_PUBLIC_KEY` precisa estar em uma única linha, com `\n` literais; prefira o comando imperativo do CD para usar o PEM multilinha natural.
 
 ```bash
 # Renderiza segredo
 
-export CHANGE_ME_STRONG_PASSWORD=<SENHA_DB>
 export JWT_SECRET=<JWT_SECRET>
 export JWT_REFRESH_SECRET=<JWT_REFRESH_SECRET>
 export CUSTOMER_JWT_PUBLIC_KEY=<CUSTOMER_JWT_PUBLIC_KEY>
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://datadog-agent.oficina.svc:4318
 
 envsubst \
-'${CHANGE_ME_STRONG_PASSWORD} ${JWT_SECRET} ${JWT_REFRESH_SECRET} ${CUSTOMER_JWT_PUBLIC_KEY}' \
+'${JWT_SECRET} ${JWT_REFRESH_SECRET} ${CUSTOMER_JWT_PUBLIC_KEY}' \
 < k8s/01-api-secret.yaml \
 > k8s/01-api-secret.rendered.yaml
 
@@ -357,10 +359,13 @@ envsubst '${OTEL_EXPORTER_OTLP_ENDPOINT}' \
 
 # Renderiza imagem
 
-sed "s|IMAGE_URI_PLACEHOLDER|<IMAGE_URI>|g" k8s/03-api-deployment.yaml > k8s/03-api-deployment.rendered.yaml
+sed -e "s|IMAGE_URI_PLACEHOLDER|<IMAGE_URI>|g" \
+  k8s/03-api-deployment.yaml > k8s/03-api-deployment.rendered.yaml
 
 # Aplica recursos da aplicação
 
+kubectl get secret database-credentials -n oficina \
+  -o go-template='{{.metadata.name}} {{range $key, $_ := .data}}{{$key}}{{end}}{{"\n"}}'
 kubectl apply -f k8s/01-api-secret.rendered.yaml
 kubectl apply -f k8s/02-api-configmap.rendered.yaml
 kubectl apply -f k8s/03-api-deployment.rendered.yaml

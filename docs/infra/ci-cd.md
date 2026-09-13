@@ -117,15 +117,18 @@ Os 5 jobs de validação rodam **em paralelo** (fail-fast); passando todos, o `o
 
 ## 2) Workflow de CD (`cd.yml`)
 
-![Diagrama do workflow de CD: DAG de 3 jobs — build-push-image, db-migrate e app-deploy](../diagrams/cd-workflow.png)
+![Diagrama do workflow de CD da API](../diagrams/cd-workflow.png)
 
-Escopo: `push` em `main` (após o merge) e `workflow_dispatch` (deploy sob demanda). O filtro do evento e as condições dos jobs referenciam `main` literalmente; cada job exige também `vars.ENABLE_DEPLOY == 'true' || github.event_name == 'workflow_dispatch'`. O workflow roda sob `environment: production`, com concorrência que não cancela execução em andamento. A ordem é um **DAG por `needs:`**: `build-push-image` → `db-migrate` → `app-deploy`.
+Escopo: `push` em `main` (após o merge) e `workflow_dispatch` (deploy sob demanda). O filtro do evento e as condições dos jobs referenciam `main` literalmente; cada job exige também `vars.ENABLE_DEPLOY == 'true' || github.event_name == 'workflow_dispatch'`. O workflow roda sob `environment: production`, com concorrência que não cancela execução em andamento. A ordem é um **DAG de quatro jobs por `needs:`**: `build-push-image` → `prepare-deploy` → `db-migrate` → `app-deploy`. As dependências diretas adicionais permitem receber a imagem do build e aguardar o sucesso da preparação/migration, sem repassar metadados de credenciais entre jobs.
 
 | # | Job | `needs:` | O que faz |
 |---|---|---|---|
 | 1 | `build-push-image` | — | Login no Amazon ECR, build **único** da imagem multi-stage NestJS e push com tag por commit (`:sha`) e tag móvel `:latest`; exporta o `image_uri` |
-| 2 | `db-migrate` | `build-push-image` | **Valida `CUSTOMER_JWT_PUBLIC_KEY`** (presente e com formato PEM) antes de tocar em AWS/kubectl — falha rápido e com causa explícita em vez de deixar o pod da API entrar em `CrashLoopBackOff` mais adiante; configura o kubeconfig; cria o `Secret` da API de forma **imperativa** (`kubectl create secret generic api-secret --from-literal=... --dry-run=client -o yaml \| kubectl apply -f -` — não renderiza `01-api-secret.yaml` via `envsubst`, justamente para aceitar `CUSTOMER_JWT_PUBLIC_KEY` como PEM multilinha sem quebrar o YAML); renderiza `OTEL_EXPORTER_OTLP_ENDPOINT` de `vars.OTEL_EXPORTER_OTLP_ENDPOINT` no ConfigMap e o aplica; **renderiza `k8s/00-db-migrate-job.yaml`** (nome único por run + imagem identificada pela tag do commit via `sed`) e aplica o Kubernetes Job: **`prisma migrate deploy` + `prisma db seed`** — só migrations pendentes (não-destrutivo, nunca reseta) e seed idempotente (`upsert`, sem duplicar). Aguarda a conclusão consultando `.status.succeeded`/`.status.failed` do Job — **não** `kubectl wait --for=condition=Complete`, que espera uma condição só e nunca a veria num Job que quebra com `backoffLimit: 0` (esse recebe `Failed`), fazendo a falha aparecer apenas quando o timeout de 900 s estourasse, com a fila de deploys segurada por `concurrency: production`. Sucesso e falha são detectados na hora; o prazo continua sendo a rede de segurança, e em qualquer saída não-bem-sucedida o passo imprime `describe` + logs do pod |
-| 3 | `app-deploy` | `build-push-image` + `db-migrate` | Renderiza `k8s/03-api-deployment.yaml` com a tag do commit e aplica os manifests Kubernetes — o **MailHog** (`Deployment` + `Service`) e o `Deployment`/`Service`/`HPA` da API; quando `ENABLE_TELEMETRY_COLLECTION == 'true'`, valida `DD_API_KEY` e aplica a camada do Datadog Agent; por fim, aguarda o rollout do Deployment da API |
+| 2 | `prepare-deploy` | `build-push-image` | **Valida `CUSTOMER_JWT_PUBLIC_KEY`** (presente e com formato PEM) antes de chamadas AWS/kubectl, para evitar uma falha tardia de autenticação no Pod. Configura a própria sessão AWS/kubeconfig; descobre RDS/Secret, espera `available`/`active`, lê `AWSCURRENT`, monta a URL com encoding/TLS e materializa somente `DATABASE_URL` em `database-credentials`. Em outro step, cria `api-secret` imperativamente apenas com JWTs/chave pública, preservando PEM multilinha sem `envsubst`, e renderiza/aplica `OTEL_EXPORTER_OTLP_ENDPOINT` no ConfigMap. Não publica outputs |
+| 3 | `db-migrate` | `build-push-image` + `prepare-deploy` | Configura sua própria sessão AWS/kubeconfig; **renderiza `k8s/00-db-migrate-job.yaml`** com nome único por run/tentativa e imagem da tag do commit via `sed`; executa **`prisma migrate deploy` + `prisma db seed`**. Aplica somente migrations pendentes (não destrutivo, nunca reseta) e seed idempotente (`upsert`, sem duplicar). Detecta sucesso/falha por `.status.succeeded`/`.status.failed`, com limite de 900 s; saída não bem-sucedida coleta `describe` do Job e logs do Pod. Não recupera nem publica credenciais |
+| 4 | `app-deploy` | `build-push-image` + `prepare-deploy` + `db-migrate` | Renderiza `k8s/03-api-deployment.yaml` com a tag do commit, sem annotation de versão da credencial. Aplica **MailHog** (`Deployment` + `Service`) e `Deployment`/`Service`/`HPA` da API; quando `ENABLE_TELEMETRY_COLLECTION == 'true'`, valida `DD_API_KEY` e aplica a camada do Datadog Agent; aguarda o rollout da API |
+
+O Job usa `backoffLimit: 0`: uma execução quebrada recebe `Failed`, não `Complete`. Por isso o workflow **não usa `kubectl wait --for=condition=Complete`** como única espera — esse comando só perceberia o problema quando expirasse. O polling verifica os contadores de sucesso e falha a cada 5 s; os 900 s são a rede de segurança para uma execução que não termina. Isso evita segurar desnecessariamente a fila serializada por `concurrency: production`. Em timeout/falha, o próprio step coleta diagnóstico antes de reprovar, bloqueando o deploy; após sucesso, o step seguinte mostra os logs de migration/seed.
 
 ### Steps de cada job de CD
 
@@ -139,7 +142,7 @@ Escopo: `push` em `main` (após o merge) e `workflow_dispatch` (deploy sob deman
 | 4 | Set image metadata | Calcula repositório/tag por commit e publica `image_meta.outputs.image_uri` para os consumidores. |
 | 5 | Build and Push Image | Constrói uma única imagem multi-stage e publica a tag por commit e latest; falha de build/push reprova. |
 
-#### `db-migrate` — DB Migrate & Seed
+#### `prepare-deploy` — Prepare Deployment Configuration
 
 | # | Step no workflow | O que faz |
 | --- | --- | --- |
@@ -147,10 +150,19 @@ Escopo: `push` em `main` (após o merge) e `workflow_dispatch` (deploy sob deman
 | 2 | Validate required secrets | Confere `CUSTOMER_JWT_PUBLIC_KEY` e seu formato PEM antes de chamadas AWS/Kubernetes; ausência ou formato inválido reprova. |
 | 3 | Configure AWS Credentials | Configura access key, secret key e session token da mesma sessão AWS, em us-east-1. |
 | 4 | Configure kubectl | Configura o kubeconfig do EKS com as credenciais desse job; não herda a sessão do job anterior. |
-| 5 | Render and apply API secrets and ConfigMap | Cria o Secret imperativamente para preservar PEM multilinha e renderiza/aplica o ConfigMap, incluindo o endpoint OTLP. |
-| 6 | Apply DB migration Job | Renderiza o Job com nome exclusivo do run e image_uri da tag do commit; aplica migrate deploy + seed e expõe `db_job`. |
-| 7 | Wait DB migration Job completion | Consulta sucesso/falha do Job com prazo de segurança; erro imprime diagnóstico e reprova imediatamente. |
-| 8 | Show DB migration Job logs | Exibe os logs do Job de migration após a conclusão, para revisão do que executou. |
+| 5 | Discover and materialize database credentials | Usa `vars.RDS_INSTANCE_IDENTIFIER` e `vars.K8S_NAMESPACE`; faz até 60 consultas com intervalo de 10 s para `available`/`active`, lê somente `SecretString` de `AWSCURRENT` e verifica campos obrigatórios/porta/username, sem regex redundantes sobre formatos AWS. Um trecho Node.js **inline** aplica percent-encoding, mascara as representações sensíveis e envia o manifesto de `database-credentials` ao `kubectl` por stdin, sem publicar outputs. O job inteiro tem limite de 15 min. |
+| 6 | Render and apply application secrets and ConfigMap | Cria `api-secret` imperativamente apenas com `JWT_SECRET`, `JWT_REFRESH_SECRET` e `CUSTOMER_JWT_PUBLIC_KEY`, preservando o PEM multilinha, e renderiza/aplica o ConfigMap. |
+
+#### `db-migrate` — DB Migrate & Seed
+
+| # | Step no workflow | O que faz |
+| --- | --- | --- |
+| 1 | actions/checkout | Obtém a revisão que disparou o workflow. |
+| 2 | Configure AWS Credentials | Configura a sessão AWS desse job; não herda credenciais/environment da preparação. |
+| 3 | Configure kubectl | Configura seu próprio kubeconfig do EKS. |
+| 4 | Apply DB migration Job | Renderiza o Job com nome exclusivo do run/tentativa e `image_uri` do build; aplica migrate deploy + seed e expõe `db_job.outputs.job_name`. |
+| 5 | Wait DB migration Job completion | Consulta `.status.succeeded`/`.status.failed` a cada 5 s, por até 900 s; falha/timeout coleta diagnóstico do Job e logs do Pod, sem consultar Secret/environment. |
+| 6 | Show DB migration Job logs | Exibe os logs de migration/seed após sucesso. |
 
 #### `app-deploy` — App Deploy
 
@@ -159,7 +171,7 @@ Escopo: `push` em `main` (após o merge) e `workflow_dispatch` (deploy sob deman
 | 1 | actions/checkout | Obtém a revisão que disparou o workflow; os comandos seguintes usam esse checkout. |
 | 2 | Configure AWS Credentials | Configura access key, secret key e session token da mesma sessão AWS, em us-east-1. |
 | 3 | Configure kubectl | Configura o kubeconfig do EKS com as credenciais desse job; não herda a sessão do job anterior. |
-| 4 | Render deployment manifest with immutable image | Nome literal do step: fixa image_uri pela tag do commit no Deployment; a política MUTABLE do ECR não fixa digest. |
+| 4 | Render deployment manifest with immutable image | Fixa image_uri pela tag do commit; a política MUTABLE do ECR não fixa digest. Não injeta metadados de versão da credencial. |
 | 5 | Apply Kubernetes manifests | Aplica MailHog e os recursos da API (Deployment, Service, HPA) com configuração renderizada. |
 | 6 | Apply telemetry collection layer | Só com ENABLE_TELEMETRY_COLLECTION=true: verifica DD_API_KEY e aplica a coleta do Datadog Agent. |
 | 7 | Wait rollout | Aguarda o rollout corrente do Deployment; indisponibilidade dentro do prazo reprova. O step não executa `rollout restart`. |
@@ -259,15 +271,11 @@ Para que os workflows e o provisionamento funcionem corretamente, é necessário
 | Secret | `SEED_ADMIN_PASSWORD` | `dast.yml` | Senha do admin do seed para o mesmo login — secret para não expor no arquivo do workflow e mascarar nos logs |
 | Variable | `BOT_APP_ID` | `ci.yml` | Identidade do GitHub App que o job `open-pr` usa para abrir o PR de modo que dispare o `sast.yml` (o `GITHUB_TOKEN` não dispara workflows) |
 | Secret | `BOT_PRIVATE_KEY` | `ci.yml` | Chave privada do mesmo GitHub App |
-| Secret | `DB_PASSWORD` ou `TF_VAR_DB_PASSWORD` | `cd.yml` | Senha do PostgreSQL RDS: `DB_PASSWORD` tem precedência; o fallback é `TF_VAR_DB_PASSWORD`. O `db-migrate` compõe a `DATABASE_URL` do `api-secret` criado via `kubectl create secret` |
 | Secret | `JWT_SECRET` | `cd.yml` | Assinatura dos access tokens JWT |
 | Secret | `JWT_REFRESH_SECRET` | `cd.yml` | Assinatura dos refresh tokens JWT |
-| Secret | `CUSTOMER_JWT_PUBLIC_KEY` | `cd.yml` | Chave **pública** RS256 usada para verificar o token externo (`customer-jwt`) do Cliente da Oficina — a chave privada correspondente vive na função serverless externa, fora deste repositório. Pode ser cadastrada no formato PEM natural (multilinha); o `db-migrate` cria o Secret via `kubectl create secret --from-literal`, que não exige convertê-la para uma linha só — ver [kubernetes.md](kubernetes.md#convenções-labels-e-wiring-de-configuração) |
+| Secret | `CUSTOMER_JWT_PUBLIC_KEY` | `cd.yml` | Chave **pública** RS256 usada para verificar o token externo (`customer-jwt`) do Cliente da Oficina — a chave privada correspondente vive na função serverless externa, fora deste repositório. Pode ser cadastrada no formato PEM natural (multilinha); `prepare-deploy` cria o Secret via `kubectl create secret --from-literal`, que não exige convertê-la para uma linha só — ver [kubernetes.md](kubernetes.md#convenções-labels-e-wiring-de-configuração) |
 | Secret | `DD_API_KEY` | `cd.yml` | Chave usada pelo Datadog Agent; obrigatória quando `ENABLE_TELEMETRY_COLLECTION == 'true'` |
-| Variable | `DB_HOST` | `cd.yml` | Endereço DNS do banco RDS (ex: `rds-oficina-mecanica.xxxx.us-east-1.rds.amazonaws.com`) |
-| Variable | `DB_USER` | `cd.yml` | Usuário do banco PostgreSQL (padrão: `techchallenge`) |
-| Variable | `DB_PORT` | `cd.yml` | Porta do PostgreSQL (padrão: `5432`) |
-| Variable | `DB_NAME` | `cd.yml` | Nome da base de dados (padrão: `techchallenge`) |
+| Variable | `RDS_INSTANCE_IDENTIFIER` | `cd.yml` | Identificador estável usado para descobrir endpoint, porta, banco, usuário e ARN; valor de produção: `rds-oficina-mecanica` |
 | Variable | `ENABLE_TELEMETRY_COLLECTION` | `cd.yml` | Quando `true`, aplica o Secret, o DaemonSet e o Service do Datadog Agent |
 | Variable | `OTEL_EXPORTER_OTLP_ENDPOINT` | `cd.yml` | Renderizada no ConfigMap da API; vazia desliga o SDK OpenTelemetry, e preenchida aponta traces e métricas para um coletor OTLP/HTTP |
 | Variable | `PRISMA_GENERATE_DATABASE_URL` | `ci.yml`, `cd.yml`, `sast.yml` | URL fake usada apenas pelo `prisma generate` (só parseada, nunca conectada); há fallback embutido nos workflows |
@@ -275,19 +283,23 @@ Para que os workflows e o provisionamento funcionem corretamente, é necessário
 | Variable | `EKS_CLUSTER_NAME` | `cd.yml` | Nome do cluster EKS usado para `aws eks update-kubeconfig` |
 | Variable | `K8S_DEPLOYMENT_NAME` | `cd.yml` | Nome do Deployment usado no `kubectl rollout status` |
 | Variable | `K8S_NAMESPACE` | `cd.yml` | Namespace onde a aplicação e os Jobs de banco são aplicados |
-| Variable | `ENABLE_DEPLOY` | `cd.yml` | Habilita ou desabilita os jobs que tocam o cluster (`build-push-image`, `db-migrate`, `app-deploy`) |
+| Variable | `ENABLE_DEPLOY` | `cd.yml` | Habilita ou desabilita os quatro jobs de CD (`build-push-image`, `prepare-deploy`, `db-migrate`, `app-deploy`), salvo dispatch manual |
 
-`ENABLE_TELEMETRY_COLLECTION` e `OTEL_EXPORTER_OTLP_ENDPOINT` são controles independentes: o primeiro aplica a camada do Agent e o segundo liga o SDK da aplicação. O workflow aplica o ConfigMap no job `db-migrate`; depois, o `app-deploy` aplica o Deployment renderizado com a imagem do commit e aguarda o rollout corrente. Não há um `rollout restart` explícito.
+`ENABLE_TELEMETRY_COLLECTION` e `OTEL_EXPORTER_OTLP_ENDPOINT` são controles independentes: o primeiro aplica a camada do Agent e o segundo liga o SDK da aplicação. O workflow aplica o ConfigMap no job `prepare-deploy`; depois de migration/seed, `app-deploy` aplica o Deployment com imagem do commit e aguarda o rollout corrente. Não há um `rollout restart` explícito nem annotation de versão da credencial.
 
 Os secrets ficam no nível do repositório ou organização porque são consumidos por mais de um contexto. Como as credenciais são de laboratório do AWS Academy, o `AWS_SESSION_TOKEN` expira quando o lab é reiniciado e precisa ser reconfigurado a cada sessão.
 
 ### Injeção de secrets da aplicação
 
-- Antes de qualquer chamada AWS/kubectl, o job `db-migrate` roda o passo `Validate required secrets`: se `CUSTOMER_JWT_PUBLIC_KEY` não estiver cadastrado (string vazia) ou não contiver `BEGIN PUBLIC KEY`, o job falha imediatamente com `::error::` explicando a causa. Sem essa checagem, a falha só apareceria depois — no pod da API, como um `TypeError: JwtStrategy requires a secret or key` genérico do `passport-jwt`, já em `CrashLoopBackOff`.
-- O secret `DB_PASSWORD` deve ser idêntico ao configurado no repositório `oficina-mecanica-infra-database`.
-- No workflow de deploy (`cd.yml`), o job `db-migrate` cria o Secret `api-secret` de forma **imperativa** — `kubectl create secret generic api-secret --from-literal=DATABASE_URL="..." --from-literal=JWT_SECRET="..." ... --dry-run=client -o yaml | kubectl apply -f -` —, compondo a `DATABASE_URL` a partir de `DB_HOST`, `DB_USER`, `DB_PORT`, `DB_NAME` e `DB_PASSWORD`, consumida pela API e pelo Job de migração.
-- O job cria `api-secret` com `kubectl create secret --from-literal`; `k8s/01-api-secret.yaml` permanece apenas como referência para deploy manual (ver [kubernetes.md](kubernetes.md#deploy-em-kubernetes-manual)). `--from-literal` aceita cada valor exatamente como a variável de ambiente do job o carrega — sem re-escapar quebras de linha —, o que importa para `CUSTOMER_JWT_PUBLIC_KEY`: uma chave PEM colada no formato natural (multilinha) quebraria o YAML gerado por `envsubst`, mas não quebra `--from-literal`.
-- Além das credenciais do PostgreSQL RDS, o workflow também injeta os secrets:
+- Antes das chamadas AWS/kubectl da preparação, `prepare-deploy` roda `Validate required secrets`: se `CUSTOMER_JWT_PUBLIC_KEY` não estiver cadastrado (string vazia) ou não contiver `BEGIN PUBLIC KEY`, o job falha imediatamente com `::error::` explicando a causa. Sem essa checagem, a falha só apareceria depois — no pod da API, como um `TypeError: JwtStrategy requires a secret or key` genérico do `passport-jwt`, já em `CrashLoopBackOff`. O build anterior já usa AWS/ECR, mas não aplica configuração ao cluster.
+- A credencial do banco não existe nos settings do GitHub. O CD descobre os metadados pelo RDS, lê o ARN completo em `MasterUserSecret`, obtém `AWSCURRENT` e materializa a URL apenas no Secret Kubernetes `database-credentials`, por manifesto JSON via stdin.
+- Senha, senha percent-encoded, URL e URL em base64 são mascaradas antes do `kubectl`; não são enviadas a argumentos de processo, outputs, artifacts ou arquivos renderizados. As máscaras protegem logs, não command lines, e base64 não é criptografia. A preparação não publica outputs de versão.
+- Todas as stacks foram destruídas e o deploy será greenfield, com rotação automática desabilitada. Os novos Pods carregam o Secret recém-materializado, sem controle de versão no pod template. Se somente a credencial mudar em um ambiente com Pods existentes e a mesma imagem, atualizar o Secret não renova seu environment nem força novo rollout; esse cenário exige revisão do fluxo.
+- O job cria `api-secret` separadamente com `kubectl create secret --from-literal`; `k8s/01-api-secret.yaml` permanece como referência segura para deploy manual (ver [kubernetes.md](kubernetes.md#deploy-em-kubernetes-manual)). Esse Secret contém somente:
   - `JWT_SECRET`
   - `JWT_REFRESH_SECRET`
   - `CUSTOMER_JWT_PUBLIC_KEY`
+
+O comando imperativo aceita o PEM multilinha sem re-escapar quebras de linha. Renderizar essa chave crua em `stringData` com `envsubst` quebraria o YAML; por isso o manifesto de referência não é o mecanismo usado pelo CD. A credencial do banco tem transporte separado: manifesto JSON criado pelo trecho Node.js inline e aplicado por stdin, nunca `--from-literal=DATABASE_URL` ou `jq --arg` com a URL/base64. Não existe arquivo Node.js auxiliar de produção.
+
+A decisão completa e as alternativas rejeitadas estão no [ADR 0017](../adr/0017-materializacao-da-credencial-do-banco-no-cd.md).

@@ -369,6 +369,17 @@ A aplicação emite logs JSON estruturados no stdout, com correlação por `requ
 
 A arquitetura detalhada de logging, redação, correlação, traces, métricas de negócio e degradação está concentrada em [Observabilidade da API](observability.md). As decisões e trade-offs permanecem registrados nos [ADRs 0002](adr/0002-logging-estruturado.md) e [0005](adr/0005-opentelemetry.md).
 
+## Credencial do banco no deploy
+
+Em produção, `prepare-deploy` do CD é a ponte entre o Secret gerenciado pelo RDS e o contrato
+`DATABASE_URL` do Prisma. Ele descobre o ARN/endpoint, lê `AWSCURRENT` e materializa
+`database-credentials` com Node.js inline e stdin. O job `db-migrate` seguinte
+executa somente migration/seed; `app-deploy` aplica a imagem e aguarda o rollout; `api-secret` permanece separado,
+somente com material JWT. Nenhum Pod lê AWS e não há ESO ou Secrets Store CSI.
+
+Veja o [ADR 0017](adr/0017-materializacao-da-credencial-do-banco-no-cd.md) e o
+[fluxo detalhado do CD](infra/ci-cd.md#2-workflow-de-cd-cdyml).
+
 ## Decisões de Arquitetura (ADRs)
 
 Decisões arquiteturais relevantes são registradas em [`docs/adr/`](./adr) no formato Markdown:
@@ -389,6 +400,7 @@ Decisões arquiteturais relevantes são registradas em [`docs/adr/`](./adr) no f
 - [ADR 0014 — Pipelines de CI, CD, SAST e DAST separados](./adr/0014-pipelines-ci-cd-sast-dast-separados.md)
 - [ADR 0015 — Testes E2E contra PostgreSQL real via Testcontainers, não mocks](./adr/0015-testcontainers-e2e-postgresql-real.md)
 - [ADR 0016 — Sanitização e validação de entrada em duas camadas](./adr/0016-sanitizacao-e-validacao-em-duas-camadas.md)
+- [ADR 0017 — Materialização da credencial do banco no CD](./adr/0017-materializacao-da-credencial-do-banco-no-cd.md)
 
 ## Modelo C4
 
