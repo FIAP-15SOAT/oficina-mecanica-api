@@ -56,9 +56,27 @@ Os tipos de coluna mostrados no diagrama são os tipos **reais gerados no Postgr
 - **Identidades compostas**: `WorkOrderService`, `WorkOrderPartSupply`, `QuoteService` e `QuotePartSupply` usam chave primária composta `(parentId, itemId)` em vez de surrogate key.
 - **Índices secundários** por colunas usadas em filtros (`status`, `customer_id`, `vehicle_id`, `assigned_user_id`, `part_supply_id`, `work_order_id`, etc.) e índice composto `(status, created_at)` em `work_orders` para listagens ordenadas.
 
+## Conexão em produção
+
+O Amazon RDS gera e mantém a master password em um Secret do AWS Secrets
+Manager, com rotação automática desabilitada. No CD da API, o job `prepare-deploy` descobre os metadados da instância por
+`vars.RDS_INSTANCE_IDENTIFIER`, lê o estágio `AWSCURRENT`, aplica percent-encoding
+ao usuário e à senha e materializa a URL com TLS no Secret Kubernetes
+`database-credentials`. O Job de migration/seed e o Deployment consomem a mesma
+chave `DATABASE_URL`; não existe senha do banco nos settings do GitHub.
+
+A preparação usa Node.js inline e aplica o manifesto por stdin. `db-migrate`
+executa somente migration/seed; `app-deploy` aplica a imagem e aguarda o rollout.
+O deploy é greenfield, sem annotation/output de versão da credencial; uma
+mudança isolada do Secret não renova o environment de Pods existentes.
+
+Esse fluxo não altera o contrato do Prisma nem o runtime. CI/E2E usam bancos
+descartáveis e uma URL própria. Detalhes e alternativas estão no
+[ADR 0017](adr/0017-materializacao-da-credencial-do-banco-no-cd.md).
+
 ## Referências
 
 - [ADR 0001 — Uso do PostgreSQL como banco de dados relacional](adr/0001-uso-do-postgresql-como-banco-de-dados.md)
 - [ADR 0004 — Autenticação externa de clientes por CPF](adr/0004-autenticacao-de-clientes.md)
 - [ADR 0010 — Concorrência otimista via coluna `version`](adr/0010-concorrencia-otimista-via-version.md)
-- [`oficina-mecanica-database` — ADRs do banco gerenciado (RDS)](https://github.com/FIAP-15SOAT/oficina-mecanica-database/tree/main/docs/adr)
+- [`oficina-mecanica-infra-database` — ADRs do banco gerenciado (RDS)](https://github.com/FIAP-15SOAT/oficina-mecanica-infra-database/tree/main/docs/adr)

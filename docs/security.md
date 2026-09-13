@@ -35,6 +35,15 @@ Relatórios de segurança da aplicação ficam versionados em [`reports/`](../re
 - Código de redefinição de senha numérico (6 dígitos), com escopo curto: expira em **10 minutos** e é bloqueado após **5 tentativas** incorretas, emitido apenas por um Admin (`POST /users/:userId/password-resets`) — nunca autoatendido
 - **Trocar ou resetar a senha invalida imediatamente todos os access e refresh tokens emitidos antes da troca, sem lista de revogação.** `User.passwordChangedAt` é atualizado no único ponto por onde a senha muda (`User.changePassword()` — usado tanto por `PATCH /api/me/password` quanto pelo reset por código); as três verificações (`JwtStrategy`, `CustomerJwtStrategy`, `RefreshTokenUseCase`) comparam o `iat` do token com esse campo, recarregado do banco a cada requisição, e recusam qualquer token anterior. Nenhuma consulta extra: o `User` já é carregado nos três pontos por outro motivo (checar `isActive`/vínculos).
 
+## Credencial do banco em produção
+
+- A master password pertence ao RDS/Secrets Manager e não é armazenada em GitHub Secret, Variable ou Terraform State corrente.
+- `prepare-deploy` do CD lê `AWSCURRENT`, mascara senha, senha percent-encoded, URL e URL em base64 e aplica por stdin um manifesto do Secret `database-credentials`; nenhuma representação sensível segue para argumento de processo, output, artifact ou arquivo renderizado. Máscaras protegem logs, não command lines; base64 não é criptografia.
+- `api-secret` contém somente `JWT_SECRET`, `JWT_REFRESH_SECRET` e `CUSTOMER_JWT_PUBLIC_KEY`, evitando misturar lifecycles.
+- Job e Deployment apenas recebem `DATABASE_URL` via `secretKeyRef`. Não há credencial AWS, IRSA, Pod Identity, ESO, CSI/ASCP ou chamada ao Secrets Manager nesses workloads.
+
+O desenho e as alternativas estão no [ADR 0017](./adr/0017-materializacao-da-credencial-do-banco-no-cd.md).
+
 ## Riscos residuais aceitos
 
 - **Não há limitação de frequência de requisições** no login interno (`POST /api/auth/login`) nesta entrega — risco preexistente, não introduzido pela autenticação externa de clientes.

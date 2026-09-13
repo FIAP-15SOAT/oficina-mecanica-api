@@ -63,9 +63,10 @@ jobs:
             DATABASE_URL=${{ vars.PRISMA_GENERATE_DATABASE_URL || 'postgresql://prisma:prisma@localhost:5432/prisma?schema=public' }}
             SERVICE_VERSION=${{ github.sha }}
 
-  db-migrate:
-    name: DB Migrate & Seed
+  prepare-deploy:
+    name: Prepare Deployment Configuration
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: production
     needs:
       - build-push-image
@@ -74,7 +75,6 @@ jobs:
       (vars.ENABLE_DEPLOY == 'true' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
-
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -106,13 +106,71 @@ jobs:
       - name: Configure kubectl
         run: aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "${{ vars.EKS_CLUSTER_NAME }}"
 
-      - name: Render and apply API secrets and ConfigMap
+      - name: Discover and materialize database credentials
         env:
-          DB_USER: ${{ vars.DB_USER || 'techchallenge' }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD || secrets.TF_VAR_DB_PASSWORD }}
-          DB_HOST: ${{ vars.DB_HOST }}
-          DB_PORT: ${{ vars.DB_PORT || '5432' }}
-          DB_NAME: ${{ vars.DB_NAME || 'techchallenge' }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          RDS_INSTANCE_IDENTIFIER: ${{ vars.RDS_INSTANCE_IDENTIFIER }}
+        run: |
+          set -euo pipefail
+          : "${K8S_NAMESPACE:?K8S_NAMESPACE repository variable is required}"
+          : "${RDS_INSTANCE_IDENTIFIER:?RDS_INSTANCE_IDENTIFIER repository variable is required}"
+
+          READY=false
+          for attempt in {1..60}; do
+            RDS_METADATA="$(aws rds describe-db-instances \
+              --db-instance-identifier "${RDS_INSTANCE_IDENTIFIER}" \
+              --query 'DBInstances[0]' --output json --no-cli-pager)"
+            if jq -e '.DBInstanceStatus == "available" and .MasterUserSecret.SecretStatus == "active"' \
+              <<< "${RDS_METADATA}" > /dev/null; then
+              READY=true
+              break
+            fi
+            echo "Waiting for RDS ${RDS_INSTANCE_IDENTIFIER}, attempt=${attempt}/60."
+            sleep 10
+          done
+          if [[ "${READY}" != "true" ]]; then
+            echo "::error::RDS ${RDS_INSTANCE_IDENTIFIER} did not reach available/active before timeout."
+            exit 1
+          fi
+
+          SECRET_ARN="$(jq -er '.MasterUserSecret.SecretArn | select(type == "string" and length > 0)' <<< "${RDS_METADATA}")"
+          SECRET_STRING="$(aws secretsmanager get-secret-value \
+            --secret-id "${SECRET_ARN}" --version-stage AWSCURRENT \
+            --query SecretString --output text --no-cli-pager)"
+          RDS_METADATA="${RDS_METADATA}" SECRET_STRING="${SECRET_STRING}" node <<'NODE'
+          const { spawnSync } = require('node:child_process');
+          let phase = 'parsing AWS responses';
+          try {
+            const db = JSON.parse(process.env.RDS_METADATA);
+            const credentials = JSON.parse(process.env.SECRET_STRING);
+            phase = 'checking required connection fields';
+            const required = [db.Endpoint?.Address, db.DBName, db.MasterUsername,
+              db.MasterUserSecret?.SecretArn, credentials.username, credentials.password];
+            if (required.some(value => typeof value !== 'string' || !value) ||
+                !Number.isInteger(db.Endpoint?.Port) || db.Endpoint.Port < 1 || db.Endpoint.Port > 65535 ||
+                credentials.username !== db.MasterUsername) throw new Error();
+            const encodedPassword = encodeURIComponent(credentials.password);
+            const url = `postgresql://${encodeURIComponent(credentials.username)}:${encodedPassword}` +
+              `@${db.Endpoint.Address}:${db.Endpoint.Port}/${db.DBName}?schema=public&sslmode=require&uselibpqcompat=true`;
+            const data = Buffer.from(url).toString('base64');
+            for (const value of [credentials.password, encodedPassword, url, data]) {
+              console.log(`::add-mask::${value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}`);
+            }
+            phase = 'applying database-credentials to Kubernetes';
+            const manifest = { apiVersion: 'v1', kind: 'Secret', type: 'Opaque',
+              metadata: { name: 'database-credentials', namespace: process.env.K8S_NAMESPACE },
+              data: { DATABASE_URL: data } };
+            const applied = spawnSync('kubectl', ['apply', '-f', '-'], { input: JSON.stringify(manifest), encoding: 'utf8' });
+            if (applied.status !== 0) throw new Error();
+            console.log('Database credentials were materialized from RDS metadata and AWSCURRENT.');
+          } catch {
+            console.error(`::error::Database credential materialization failed while ${phase}.`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Render and apply application secrets and ConfigMap
+        env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
           CUSTOMER_JWT_PUBLIC_KEY: ${{ secrets.CUSTOMER_JWT_PUBLIC_KEY }}
@@ -123,18 +181,9 @@ jobs:
         # (a segunda linha do PEM começa na coluna 0, sem `:`), derrubando o `kubectl apply`
         # antes da migração e do rollout. --from-literal aceita o valor como está, com
         # quebras de linha ou não, e o próprio kubectl faz o escape para o Secret.
-        #
-        # `sslmode=require&uselibpqcompat=true` é obrigatório contra o RDS: o parameter group
-        # `default.postgres16` traz `rds.force_ssl = 1`, e o node-postgres (`prisma db seed` e
-        # o `pg.Pool` do `PrismaService`) não usa TLS sem `sslmode` na string — ao contrário do
-        # motor do `prisma migrate deploy`, que negocia TLS por conta própria; daí a migração
-        # passar e o seed falhar com P1010. `uselibpqcompat=true` mantém a semântica libpq de
-        # `require` (cifra sem validar a cadeia), necessária porque a raiz do RDS é
-        # autoassinada e não está no truststore do Node. Detalhes em docs/infra/kubernetes.md.
         run: |
           kubectl create secret generic api-secret \
             --namespace "${{ vars.K8S_NAMESPACE }}" \
-            --from-literal=DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?schema=public&sslmode=require&uselibpqcompat=true" \
             --from-literal=JWT_SECRET="${JWT_SECRET}" \
             --from-literal=JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET}" \
             --from-literal=CUSTOMER_JWT_PUBLIC_KEY="${CUSTOMER_JWT_PUBLIC_KEY}" \
@@ -145,6 +194,33 @@ jobs:
             > k8s/02-api-configmap.rendered.yaml
 
           kubectl apply -f k8s/02-api-configmap.rendered.yaml
+
+  db-migrate:
+    name: DB Migrate & Seed
+    runs-on: ubuntu-latest
+    environment: production
+    needs:
+      - build-push-image
+      - prepare-deploy
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (vars.ENABLE_DEPLOY == 'true' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "${{ vars.EKS_CLUSTER_NAME }}"
 
       - name: Apply DB migration Job
         id: db_job
@@ -216,6 +292,7 @@ jobs:
     environment: production
     needs:
       - build-push-image
+      - prepare-deploy
       - db-migrate
     if: >-
       github.ref == 'refs/heads/main' &&
@@ -239,7 +316,7 @@ jobs:
 
       - name: Render deployment manifest with immutable image
         run: |
-          sed "s|IMAGE_URI_PLACEHOLDER|${{ needs.build-push-image.outputs.image_uri }}|g" \
+          sed -e "s|IMAGE_URI_PLACEHOLDER|${{ needs.build-push-image.outputs.image_uri }}|g" \
             k8s/03-api-deployment.yaml > k8s/03-api-deployment.rendered.yaml
 
       - name: Apply Kubernetes manifests

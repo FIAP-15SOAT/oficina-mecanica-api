@@ -90,6 +90,8 @@ Versões fixadas por faixa (`required_providers` + `required_version`), garantin
 - **Instância**: `db.t4g.micro` (PostgreSQL 16), com storage GP3 de 20 GiB.
 - **Subnet Group**: alocado exclusivamente nas subnets privadas da VPC (`private_subnet_ids`).
 - **Security Group**: porta `5432` liberada exclusivamente para a CIDR da VPC (`vpc_cidr`).
+- **Credencial**: `manage_master_user_password = true`; RDS gera e mantém o Secret com a chave padrão do Secrets Manager, Terraform exporta apenas seu ARN e a rotação automática fica desabilitada.
+- **State do database**: contém ARN, KMS key ID, status e metadados de conexão, mas não o valor da senha. Isso decorre do gerenciamento externo pelo RDS, não de `sensitive`, que apenas oculta a apresentação. O CD `prepare-deploy` consulta RDS/Secrets Manager diretamente, sem ler esse remote state.
 - **Resiliência**: `skip_final_snapshot = true` e `deletion_protection = false` ajustados para o escopo do laboratório AWS Academy.
 
 ## Recursos provisionados — `oficina-mecanica-infra-k8s`
@@ -140,7 +142,6 @@ O cluster e o node group utilizam roles IAM gerenciadas pelo laboratório (`LabE
 |---|---|---|---|
 | `db_name` | `string` | `techchallenge` | Nome do banco inicial |
 | `db_username` | `string` | `techchallenge` | Usuário administrador |
-| `db_password` | `string` | — (**`sensitive`**) | Senha do banco (injetada via `TF_VAR_db_password` ou `-var="db_password=..."`) |
 | `db_instance_class` | `string` | `db.t4g.micro` | Família de instância RDS |
 | `db_allocated_storage` | `number` | `20` | Tamanho do disco em GiB |
 
@@ -176,7 +177,7 @@ cd ../../oficina-mecanica-infra-database/terraform
 # Inicializa os providers e o backend remoto desta stack
 terraform init
 # Revisa o plano interativo e aplica os recursos desta stack
-terraform apply -var="db_password=<SENHA_FORTE>"
+terraform apply
 
 # 3) Provisiona o cluster EKS, ECR, NLB e recursos base
 cd ../../oficina-mecanica-infra-k8s/terraform
