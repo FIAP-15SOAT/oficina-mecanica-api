@@ -359,3 +359,4 @@ A solução é composta por **sete repositórios especializados**, com responsab
 ## 📄 Licença
 
 Projeto acadêmico (FIAP — 15SOAT), para fins educacionais. Sem licença aberta declarada (`UNLICENSED`).
+
